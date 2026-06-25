@@ -1,0 +1,482 @@
+#include "chess-library/src/include.hpp"x
+#include <iostream>
+#include <string>
+#include <sstream>
+#include <unordered_map>
+#include <chrono>
+#include <climits>
+#include <random>
+#include <vector>
+#include <algorithm>
+
+using namespace chess;
+
+// =============================================
+// ZOBRIST HASHING
+// =============================================
+struct Zobrist {
+    uint64_t pieces[2][6][64]; // [color][piece][square]
+    uint64_t sideToMove;
+    uint64_t castling[4];
+    uint64_t enPassant[8];
+
+    Zobrist() {
+        std::mt19937_64 rng(123456789ULL);
+        for (auto& c : pieces)
+            for (auto& p : c)
+                for (auto& s : p)
+                    s = rng();
+        sideToMove = rng();
+        for (auto& c : castling)  c = rng();
+        for (auto& e : enPassant) e = rng();
+    }
+
+    uint64_t hash(const Board& board) const {
+        uint64_t h = 0;
+        for (int sq = 0; sq < 64; sq++) {
+            Piece p = board.at(Square(sq));
+            if (p != Piece::NONE) {
+                int color  = (p.color() == Color::WHITE) ? 0 : 1;
+                int ptype  = (int)p.type().internal();
+                h ^= pieces[color][ptype][sq];
+            }
+        }
+        if (board.sideToMove() == Color::BLACK)
+            h ^= sideToMove;
+        return h;
+    }
+} zobrist;
+
+// =============================================
+// TRANSPOSITION TABLE
+// =============================================
+enum TTFlag { EXACT, LOWERBOUND, UPPERBOUND };
+
+struct TTEntry {
+    uint64_t hash;
+    int      depth;
+    int      score;
+    TTFlag   flag;
+    Move     bestMove;
+};
+
+const int TT_SIZE = 1 << 22; // ~4 million entries
+std::vector<TTEntry> TT(TT_SIZE);
+
+void tt_store(uint64_t hash, int depth, int score, TTFlag flag, Move best) {
+    int idx = hash % TT_SIZE;
+    TT[idx] = {hash, depth, score, flag, best};
+}
+
+bool tt_probe(uint64_t hash, int depth, int alpha, int beta,
+              int& score, Move& bestMove) {
+    int idx = hash % TT_SIZE;
+    TTEntry& e = TT[idx];
+    if (e.hash != hash) return false;
+    bestMove = e.bestMove;
+    if (e.depth >= depth) {
+        if (e.flag == EXACT) { score = e.score; return true; }
+        if (e.flag == LOWERBOUND && e.score >= beta)  { score = e.score; return true; }
+        if (e.flag == UPPERBOUND && e.score <= alpha) { score = e.score; return true; }
+    }
+    return false;
+}
+
+// =============================================
+// PIECE SQUARE TABLES (for positional eval)
+// =============================================
+// Values from white's perspective, index 0 = a1
+const int PAWN_TABLE[64] = {
+     0,  0,  0,  0,  0,  0,  0,  0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+     5,  5, 10, 25, 25, 10,  5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0
+};
+const int KNIGHT_TABLE[64] = {
+   -50,-40,-30,-30,-30,-30,-40,-50,
+   -40,-20,  0,  0,  0,  0,-20,-40,
+   -30,  0, 10, 15, 15, 10,  0,-30,
+   -30,  5, 15, 20, 20, 15,  5,-30,
+   -30,  0, 15, 20, 20, 15,  0,-30,
+   -30,  5, 10, 15, 15, 10,  5,-30,
+   -40,-20,  0,  5,  5,  0,-20,-40,
+   -50,-40,-30,-30,-30,-30,-40,-50
+};
+const int BISHOP_TABLE[64] = {
+   -20,-10,-10,-10,-10,-10,-10,-20,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -10,  0,  5, 10, 10,  5,  0,-10,
+   -10,  5,  5, 10, 10,  5,  5,-10,
+   -10,  0, 10, 10, 10, 10,  0,-10,
+   -10, 10, 10, 10, 10, 10, 10,-10,
+   -10,  5,  0,  0,  0,  0,  5,-10,
+   -20,-10,-10,-10,-10,-10,-10,-20
+};
+const int ROOK_TABLE[64] = {
+     0,  0,  0,  0,  0,  0,  0,  0,
+     5, 10, 10, 10, 10, 10, 10,  5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+     0,  0,  0,  5,  5,  0,  0,  0
+};
+const int QUEEN_TABLE[64] = {
+   -20,-10,-10, -5, -5,-10,-10,-20,
+   -10,  0,  0,  0,  0,  0,  0,-10,
+   -10,  0,  5,  5,  5,  5,  0,-10,
+    -5,  0,  5,  5,  5,  5,  0, -5,
+     0,  0,  5,  5,  5,  5,  0, -5,
+   -10,  5,  5,  5,  5,  5,  0,-10,
+   -10,  0,  5,  0,  0,  0,  0,-10,
+   -20,-10,-10, -5, -5,-10,-10,-20
+};
+const int KING_MID_TABLE[64] = {
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -30,-40,-40,-50,-50,-40,-40,-30,
+   -20,-30,-30,-40,-40,-30,-30,-20,
+   -10,-20,-20,-20,-20,-20,-20,-10,
+    20, 20,  0,  0,  0,  0, 20, 20,
+    20, 30, 10,  0,  0, 10, 30, 20
+};
+
+// =============================================
+// EVALUATION
+// =============================================
+const int PIECE_VALUES[] = {0, 100, 320, 330, 500, 900, 20000};
+// indices match PieceType internal: NONE=0, PAWN=1...KING=6
+
+int pieceSquareBonus(PieceType type, Color color, int sq) {
+    // flip square for black (they read the table from their perspective)
+    int idx = (color == Color::WHITE) ? sq : (sq ^ 56);
+    switch ((int)type.internal()) {
+        case 1: return PAWN_TABLE[idx];
+        case 2: return KNIGHT_TABLE[idx];
+        case 3: return BISHOP_TABLE[idx];
+        case 4: return ROOK_TABLE[idx];
+        case 5: return QUEEN_TABLE[idx];
+        case 6: return KING_MID_TABLE[idx];
+        default: return 0;
+    }
+}
+
+int evaluate(const Board& board) {
+    auto [reason, result] = board.isGameOver();
+    if (result == GameResult::LOSE)
+        return (board.sideToMove() == Color::WHITE) ? -100000 : 100000;
+    if (result == GameResult::DRAW)
+        return 0;
+
+    int score = 0;
+    for (int sq = 0; sq < 64; sq++) {
+        Piece p = board.at(Square(sq));
+        if (p == Piece::NONE) continue;
+        int val = PIECE_VALUES[(int)p.type().internal()];
+        int psb = pieceSquareBonus(p.type(), p.color(), sq);
+        if (p.color() == Color::WHITE)
+            score += val + psb;
+        else
+            score -= val + psb;
+    }
+    // return from side to move's perspective
+    return (board.sideToMove() == Color::WHITE) ? score : -score;
+}
+
+// =============================================
+// MOVE ORDERING
+// =============================================
+int moveScore(const Board& board, Move move) {
+    int score = 0;
+    Piece captured = board.at(move.to());
+    Piece attacker = board.at(move.from());
+    // MVV-LVA: capture high value with low value = good
+    if (captured != Piece::NONE) {
+        int capVal = PIECE_VALUES[(int)captured.type().internal()];
+        int attVal = PIECE_VALUES[(int)attacker.type().internal()];
+        score += 10 * capVal - attVal;
+    }
+    // promotion bonus
+    if (move.typeOf() == Move::PROMOTION)
+        score += 800;
+    return score;
+}
+
+void orderMoves(const Board& board, Movelist& moves, Move ttMove) {
+    std::vector<std::pair<int,int>> scores(moves.size());
+    for (int i = 0; i < (int)moves.size(); i++) {
+        int s = moveScore(board, moves[i]);
+        if (moves[i] == ttMove) s += 10000; // TT move first
+        scores[i] = {s, i};
+    }
+    std::sort(scores.begin(), scores.end(),
+              [](auto& a, auto& b){ return a.first > b.first; });
+    Movelist ordered;
+    for (auto& [s, i] : scores)
+        ordered.add(moves[i]);
+    moves = ordered;
+}
+
+// =============================================
+// QUIESCENCE SEARCH
+// =============================================
+int quiescence(Board& board, int alpha, int beta) {
+    int stand_pat = evaluate(board);
+    if (stand_pat >= beta) return beta;
+    if (stand_pat > alpha) alpha = stand_pat;
+
+    Movelist moves;
+    movegen::legalmoves(moves, board);
+
+    for (int i = 0; i < (int)moves.size(); i++) {
+        Move move = moves[i];
+        // only search captures and promotions
+        if (board.at(move.to()) == Piece::NONE &&
+            move.typeOf() != Move::PROMOTION)
+            continue;
+
+        board.makeMove(move);
+        int score = -quiescence(board, -beta, -alpha);
+        board.unmakeMove(move);
+
+        if (score >= beta) return beta;
+        if (score > alpha) alpha = score;
+    }
+    return alpha;
+}
+
+// =============================================
+// ALPHA-BETA WITH TT
+// =============================================
+int alphaBeta(Board& board, int depth, int alpha, int beta, bool maximizing) {
+    uint64_t hash = zobrist.hash(board);
+
+    // TT probe
+    int ttScore;
+    Move ttMove(Move::NULL_MOVE);
+    if (tt_probe(hash, depth, alpha, beta, ttScore, ttMove))
+        return ttScore;
+
+    auto [reason, result] = board.isGameOver();
+    if (result != GameResult::NONE)
+        return evaluate(board);
+    if (depth == 0)
+        return quiescence(board, alpha, beta);
+
+    Movelist moves;
+    movegen::legalmoves(moves, board);
+    orderMoves(board, moves, ttMove);
+
+    int origAlpha = alpha;
+    Move bestMove(Move::NULL_MOVE);
+    int  bestScore = INT_MIN;
+
+    for (int i = 0; i < (int)moves.size(); i++) {
+        board.makeMove(moves[i]);
+        int score = -alphaBeta(board, depth-1, -beta, -alpha, !maximizing);
+        board.unmakeMove(moves[i]);
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestMove  = moves[i];
+        }
+        if (score > alpha) alpha = score;
+        if (alpha >= beta) break; // cutoff
+    }
+
+    // Store in TT
+    TTFlag flag;
+    if (bestScore <= origAlpha)  flag = UPPERBOUND;
+    else if (bestScore >= beta)  flag = LOWERBOUND;
+    else                         flag = EXACT;
+    tt_store(hash, depth, bestScore, flag, bestMove);
+
+    return bestScore;
+}
+
+// =============================================
+// ITERATIVE DEEPENING WITH TIME CONTROL
+// =============================================
+using Clock = std::chrono::steady_clock;
+Clock::time_point searchStart;
+int timeLimitMs = 1000;
+bool timeUp = false;
+
+bool outOfTime() {
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - searchStart).count();
+    return elapsed >= timeLimitMs;
+}
+
+Move iterativeDeepening(Board& board, int timeLimitMsIn) {
+    searchStart  = Clock::now();
+    timeLimitMs  = timeLimitMsIn;
+    timeUp       = false;
+
+    Move bestMove(Move::NULL_MOVE);
+
+    // Fallback: pick first legal move
+    Movelist moves;
+    movegen::legalmoves(moves, board);
+    if (moves.size() > 0) bestMove = moves[0];
+
+    for (int depth = 1; depth <= 64; depth++) {
+        if (outOfTime()) break;
+
+        int  bestScore = INT_MIN;
+        Move bestMoveThisDepth(Move::NULL_MOVE);
+
+        orderMoves(board, moves, bestMove); // use last best move first
+
+        for (int i = 0; i < (int)moves.size(); i++) {
+            if (outOfTime()) break;
+            board.makeMove(moves[i]);
+            int score = -alphaBeta(board, depth-1,
+                                   INT_MIN+1, INT_MAX-1, false);
+            board.unmakeMove(moves[i]);
+
+            if (score > bestScore) {
+                bestScore         = score;
+                bestMoveThisDepth = moves[i];
+            }
+        }
+
+        if (!outOfTime() && bestMoveThisDepth != Move(Move::NULL_MOVE)) {
+            bestMove = bestMoveThisDepth;
+            std::cerr << "info depth " << depth
+                      << " score cp " << bestScore
+                      << " pv " << uci::moveToUci(bestMove) << "\n";
+        }
+    }
+    return bestMove;
+}
+
+// =============================================
+// UCI PROTOCOL
+// =============================================
+void uciLoop() {
+    Board board;
+    std::string line;
+
+    while (std::getline(std::cin, line)) {
+        std::istringstream iss(line);
+        std::string token;
+        iss >> token;
+
+        if (token == "uci") {
+            std::cout << "id name MyChessEngine\n";
+            std::cout << "id author YourName\n";
+            std::cout << "uciok\n" << std::flush;
+        }
+        else if (token == "isready") {
+            std::cout << "readyok\n" << std::flush;
+        }
+        else if (token == "ucinewgame") {
+            board = Board();
+            std::fill(TT.begin(), TT.end(), TTEntry{});
+        }
+        else if (token == "position") {
+            std::string type;
+            iss >> type;
+
+            if (type == "startpos") {
+                board = Board();
+                iss >> token; // "moves" keyword
+            } else if (type == "fen") {
+                std::string fen, part;
+                // read 6 parts of FEN
+                for (int i = 0; i < 6; i++) {
+                    iss >> part;
+                    if (i > 0) fen += " ";
+                    fen += part;
+                }
+                board = Board(fen);
+                iss >> token; // "moves" keyword
+            }
+
+            // apply moves
+            while (iss >> token) {
+                Move move = uci::uciToMove(board, token);
+                board.makeMove(move);
+            }
+        }
+        else if (token == "go") {
+            int timeLimit = 1000; // default 1 second
+            std::string sub;
+            bool isWhite = (board.sideToMove() == Color::WHITE);
+
+            while (iss >> sub) {
+                int val;
+                if (sub == "movetime") { iss >> val; timeLimit = val; }
+                else if (sub == "wtime" && isWhite)  { iss >> val; timeLimit = val / 30; }
+                else if (sub == "btime" && !isWhite) { iss >> val; timeLimit = val / 30; }
+                else if (sub == "depth") {
+                    iss >> val;
+                    // fixed depth search
+                    Move best = iterativeDeepening(board, 999999);
+                    std::cout << "bestmove " << uci::moveToUci(best) << "\n" << std::flush;
+                    goto done;
+                }
+            }
+
+            {
+                Move best = iterativeDeepening(board, timeLimit);
+                std::cout << "bestmove " << uci::moveToUci(best) << "\n" << std::flush;
+            }
+            done:;
+        }
+        else if (token == "quit") {
+            break;
+        }
+    }
+}
+
+// =============================================
+// PUZZLE SOLVER (for testing)
+// =============================================
+void solvePuzzles() {
+    struct Puzzle { std::string name, fen, expected; };
+
+    std::vector<Puzzle> puzzles = {
+        // Mate in 2
+        {"Paul Morphy vs Duke Isouard, 1858",
+         "4kb1r/p2n1ppp/4q3/4p1B1/4P3/1Q6/PPP2PPP/2KR4 w k - 1 0",
+         "Qb8+"},
+        // Mate in 3
+        {"Madame de Remusat vs Napoleon, 1802",
+         "r1b1kb1r/pppp1ppp/5q2/4n3/3KP3/2N3PN/PPP4P/R1BQ1B1R b kq - 0 1",
+         "Bc5+"},
+        // Mate in 4
+        {"Morphy vs AP Forde, 1858",
+         "r1bqr3/ppp1B1kp/1b4p1/n2B4/3PQ1P1/2P5/P4P2/RN4K1 w - - 1 0",
+         "Qe5+"},
+    };
+
+    std::cout << "\n=== PUZZLE SOLVER ===\n";
+    for (auto& p : puzzles) {
+        Board board(p.fen);
+        std::cout << "\n" << p.name << "\n";
+        std::cout << "Expected first move: " << p.expected << "\n";
+
+        Move best = iterativeDeepening(board, 5000); // 5 seconds per puzzle
+        std::cout << "Found: " << uci::moveToSan(board, best) << "\n";
+        std::cout << "UCI:   " << uci::moveToUci(best) << "\n";
+    }
+}
+
+int main(int argc, char* argv[]) {
+    if (argc > 1 && std::string(argv[1]) == "puzzles") {
+        solvePuzzles();
+    } else {
+        uciLoop();
+    }
+    return 0;
+}
+
+// arigato 
